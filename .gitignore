@@ -1,0 +1,18 @@
+# Python virtual environment
+.venv/
+.idea/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+
+# Optional: local results / processed data
+data/processed/
+results/
