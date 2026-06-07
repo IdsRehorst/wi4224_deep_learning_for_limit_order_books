@@ -207,7 +207,7 @@ def main() -> None:
 
     output_dir = project_root / "data" / "processed" / "AAPL_2012-06-21_50"
 
-    num_levels = 10
+    num_levels = 50
     horizon_seconds = 1.0
     clip_ticks = 10
     add_imbalance = True

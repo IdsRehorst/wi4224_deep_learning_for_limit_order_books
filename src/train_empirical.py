@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import json
 
 import numpy as np
@@ -6,43 +7,47 @@ from sklearn.metrics import f1_score
 
 
 def get_project_root() -> Path:
-    """
-    Assumes this file is located in project/src/.
-    """
     return Path(__file__).resolve().parents[1]
 
 
-def load_dataset(processed_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Load processed labels and metadata.
-    """
-    y_class = np.load(processed_dir / "y_class.npy")
-    y_pair = np.load(processed_dir / "y_pair.npy")
+def resolve_project_path(path: str | Path) -> Path:
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return get_project_root() / path
+
+
+def load_dataset(processed_dir: Path) -> tuple[np.ndarray, dict]:
+    y_class = np.load(processed_dir / "y_class.npy", mmap_mode="r")
 
     with open(processed_dir / "metadata.json", "r") as f:
         metadata = json.load(f)
 
-    return y_class, y_pair, metadata
+    return y_class, metadata
 
 
 def chronological_split(
     n_samples: int,
     train_fraction: float = 0.7,
     validation_fraction: float = 0.15,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Chronological train/validation/test split.
-
-    Since this is time-series data, we avoid random shuffling.
-    """
+) -> tuple[slice, slice, slice]:
     n_train = int(train_fraction * n_samples)
     n_validation = int(validation_fraction * n_samples)
 
-    train_idx = np.arange(0, n_train)
-    validation_idx = np.arange(n_train, n_train + n_validation)
-    test_idx = np.arange(n_train + n_validation, n_samples)
+    train_slice = slice(0, n_train)
+    validation_slice = slice(n_train, n_train + n_validation)
+    test_slice = slice(n_train + n_validation, n_samples)
 
-    return train_idx, validation_idx, test_idx
+    return train_slice, validation_slice, test_slice
+
+
+def decode_class(class_id: int, clip_ticks: int) -> tuple[int, int]:
+    num_values = 2 * clip_ticks + 1
+
+    delta_ask = class_id // num_values - clip_ticks
+    delta_bid = class_id % num_values - clip_ticks
+
+    return int(delta_ask), int(delta_bid)
 
 
 def fit_empirical_distribution(
@@ -50,11 +55,8 @@ def fit_empirical_distribution(
     num_classes: int,
     smoothing: float = 1e-12,
 ) -> np.ndarray:
-    """
-    Estimate the unconditional empirical class distribution.
+    y_train = np.asarray(y_train, dtype=np.int64)
 
-    A tiny smoothing value is used to avoid log(0) on validation/test data.
-    """
     counts = np.bincount(y_train, minlength=num_classes).astype(np.float64)
 
     probabilities = (counts + smoothing) / (
@@ -67,22 +69,30 @@ def fit_empirical_distribution(
 def evaluate_empirical_model(
     probabilities: np.ndarray,
     y_true: np.ndarray,
+    zero_class: int,
 ) -> dict:
-    """
-    Evaluate the empirical distribution model.
+    y_true = np.asarray(y_true, dtype=np.int64)
 
-    The probabilistic prediction is the same for every sample.
-    The class prediction is the mode of the training distribution.
-    """
     eps = 1e-15
     probabilities = np.clip(probabilities, eps, 1.0)
 
-    nll = -np.mean(np.log(probabilities[y_true]))
+    sample_nll = -np.log(probabilities[y_true])
+    nll = np.mean(sample_nll)
+
+    movement_mask = y_true != zero_class
+
+    if movement_mask.any():
+        movement_nll = np.mean(sample_nll[movement_mask])
+        movement_share = np.mean(movement_mask)
+    else:
+        movement_nll = np.nan
+        movement_share = 0.0
 
     predicted_class = int(np.argmax(probabilities))
     y_pred = np.full_like(y_true, fill_value=predicted_class)
 
     accuracy = np.mean(y_pred == y_true)
+
     macro_f1 = f1_score(
         y_true,
         y_pred,
@@ -93,22 +103,12 @@ def evaluate_empirical_model(
 
     return {
         "negative_log_likelihood": float(nll),
+        "movement_negative_log_likelihood": float(movement_nll),
+        "movement_share": float(movement_share),
         "accuracy": float(accuracy),
         "macro_f1": float(macro_f1),
         "predicted_class": predicted_class,
     }
-
-
-def decode_class(class_id: int, clip_ticks: int) -> tuple[int, int]:
-    """
-    Convert a joint class index back to (Delta A, Delta B).
-    """
-    num_values = 2 * clip_ticks + 1
-
-    delta_ask = class_id // num_values - clip_ticks
-    delta_bid = class_id % num_values - clip_ticks
-
-    return int(delta_ask), int(delta_bid)
 
 
 def print_top_classes(
@@ -116,70 +116,103 @@ def print_top_classes(
     clip_ticks: int,
     top_k: int = 10,
 ) -> None:
-    """
-    Print the most likely classes under the empirical distribution.
-    """
     order = np.argsort(probabilities)[::-1]
 
     print("Top empirical classes")
     print("---------------------")
 
     for class_id in order[:top_k]:
-        delta_ask, delta_bid = decode_class(class_id, clip_ticks)
+        delta_ask, delta_bid = decode_class(int(class_id), clip_ticks)
         probability = probabilities[class_id]
 
         print(
-            f"class {class_id:>2} "
-            f"({delta_ask:>2}, {delta_bid:>2}) : "
+            f"class {class_id:>3} "
+            f"({delta_ask:>3}, {delta_bid:>3}) : "
             f"{100 * probability:6.2f}%"
         )
 
 
+def print_metrics(name: str, metrics: dict) -> None:
+    print(
+        f"{name:<11} "
+        f"NLL: {metrics['negative_log_likelihood']:.4f} | "
+        f"Move NLL: {metrics['movement_negative_log_likelihood']:.4f} | "
+        f"Move share: {100 * metrics['movement_share']:.2f}% | "
+        f"Accuracy: {100 * metrics['accuracy']:.2f}% | "
+        f"Macro-F1: {metrics['macro_f1']:.4f}"
+    )
+
+
 def main() -> None:
-    project_root = get_project_root()
-
-    processed_dir = (
-        project_root
-        / "data"
-        / "processed"
-        / "AAPL_2012-06-21_50"
+    parser = argparse.ArgumentParser(
+        description="Train naive empirical baseline."
     )
 
-    results_dir = (
-        project_root
-        / "results"
-        / "AAPL_2012-06-21_50"
+    parser.add_argument(
+        "--processed-dir",
+        type=str,
+        default="data/processed/WSELOB_PKNORLEN_h30_L50_full_tick5",
     )
+
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default="results/WSELOB_PKNORLEN_h30_L50_full_tick5",
+    )
+
+    args = parser.parse_args()
+
+    processed_dir = resolve_project_path(args.processed_dir)
+    results_dir = resolve_project_path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    y_class, y_pair, metadata = load_dataset(processed_dir)
+    y_class, metadata = load_dataset(processed_dir)
 
     num_samples = len(y_class)
     num_classes = int(metadata["num_classes"])
     clip_ticks = int(metadata["clip_ticks"])
 
-    train_idx, validation_idx, test_idx = chronological_split(num_samples)
+    zero_class = clip_ticks * (2 * clip_ticks + 1) + clip_ticks
 
-    y_train = y_class[train_idx]
-    y_validation = y_class[validation_idx]
-    y_test = y_class[test_idx]
+    train_slice, validation_slice, test_slice = chronological_split(num_samples)
+
+    y_train = y_class[train_slice]
+    y_validation = y_class[validation_slice]
+    y_test = y_class[test_slice]
 
     probabilities = fit_empirical_distribution(
         y_train=y_train,
         num_classes=num_classes,
     )
 
-    train_metrics = evaluate_empirical_model(probabilities, y_train)
-    validation_metrics = evaluate_empirical_model(probabilities, y_validation)
-    test_metrics = evaluate_empirical_model(probabilities, y_test)
+    train_metrics = evaluate_empirical_model(
+        probabilities=probabilities,
+        y_true=y_train,
+        zero_class=zero_class,
+    )
+
+    validation_metrics = evaluate_empirical_model(
+        probabilities=probabilities,
+        y_true=y_validation,
+        zero_class=zero_class,
+    )
+
+    test_metrics = evaluate_empirical_model(
+        probabilities=probabilities,
+        y_true=y_test,
+        zero_class=zero_class,
+    )
 
     print("Naive empirical model")
     print("=====================")
+    print(f"Processed directory:     {processed_dir}")
+    print(f"Results directory:       {results_dir}")
     print(f"Number of samples:       {num_samples:,}")
-    print(f"Training samples:        {len(train_idx):,}")
-    print(f"Validation samples:      {len(validation_idx):,}")
-    print(f"Test samples:            {len(test_idx):,}")
+    print(f"Training samples:        {len(y_train):,}")
+    print(f"Validation samples:      {len(y_validation):,}")
+    print(f"Test samples:            {len(y_test):,}")
     print(f"Number of classes:       {num_classes}")
+    print(f"Zero class:              {zero_class}")
     print()
 
     print_top_classes(probabilities, clip_ticks=clip_ticks)
@@ -187,36 +220,27 @@ def main() -> None:
 
     print("Metrics")
     print("-------")
-    print(
-        f"Train NLL:       {train_metrics['negative_log_likelihood']:.4f} | "
-        f"Accuracy: {100 * train_metrics['accuracy']:.2f}% | "
-        f"Macro-F1: {train_metrics['macro_f1']:.4f}"
-    )
-    print(
-        f"Validation NLL:  {validation_metrics['negative_log_likelihood']:.4f} | "
-        f"Accuracy: {100 * validation_metrics['accuracy']:.2f}% | "
-        f"Macro-F1: {validation_metrics['macro_f1']:.4f}"
-    )
-    print(
-        f"Test NLL:        {test_metrics['negative_log_likelihood']:.4f} | "
-        f"Accuracy: {100 * test_metrics['accuracy']:.2f}% | "
-        f"Macro-F1: {test_metrics['macro_f1']:.4f}"
-    )
+    print_metrics("Train", train_metrics)
+    print_metrics("Validation", validation_metrics)
+    print_metrics("Test", test_metrics)
 
     output = {
         "model": "naive_empirical",
         "metadata": metadata,
+        "zero_class": int(zero_class),
         "train_metrics": train_metrics,
         "validation_metrics": validation_metrics,
         "test_metrics": test_metrics,
         "probabilities": probabilities.tolist(),
     }
 
-    with open(results_dir / "empirical_baseline.json", "w") as f:
+    output_path = results_dir / "empirical_baseline.json"
+
+    with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
 
     print()
-    print(f"Saved results to: {results_dir / 'empirical_baseline.json'}")
+    print(f"Saved results to: {output_path}")
 
 
 if __name__ == "__main__":

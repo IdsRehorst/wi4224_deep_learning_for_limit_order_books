@@ -12,20 +12,14 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
-
 def get_project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
 def resolve_project_path(path: str | Path) -> Path:
     path = Path(path)
-
     if path.is_absolute():
         return path
-
     return get_project_root() / path
 
 
@@ -49,16 +43,13 @@ def get_device() -> torch.device:
 
 
 def load_dataset(processed_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
-    """
-    Load feature matrix and labels using memory mapping.
-    """
     X = np.load(processed_dir / "X.npy", mmap_mode="r")
-    y_class = np.load(processed_dir / "y_class.npy", mmap_mode="r")
+    y_pair = np.load(processed_dir / "y_pair.npy", mmap_mode="r")
 
     with open(processed_dir / "metadata.json", "r") as f:
         metadata = json.load(f)
 
-    return X, y_class, metadata
+    return X, y_pair, metadata
 
 
 def chronological_split(
@@ -82,60 +73,31 @@ def decode_class(class_id: int, clip_ticks: int) -> tuple[int, int]:
     return int(delta_ask), int(delta_bid)
 
 
-# ---------------------------------------------------------------------
-# Batch iterators
-# ---------------------------------------------------------------------
-
 def iter_sequential_batches(start: int, end: int, batch_size: int):
-    """
-    Sequential contiguous batches.
-    Used for scaling and evaluation.
-    """
     for batch_start in range(start, end, batch_size):
         batch_end = min(batch_start + batch_size, end)
         yield slice(batch_start, batch_end)
 
 
-def iter_chunk_shuffled_slices(
+def iter_shuffled_batches(
     start: int,
     end: int,
     batch_size: int,
-    chunk_size: int,
     rng: np.random.Generator,
 ):
-    """
-    Shuffle large contiguous chunks, then read sequential batches inside
-    each chunk.
+    indices = np.arange(start, end)
+    rng.shuffle(indices)
 
-    This is much faster for memory-mapped arrays than fully random indexing,
-    while still giving some stochasticity during training.
-    """
-    if chunk_size < batch_size:
-        raise ValueError("chunk_size must be at least as large as batch_size.")
+    for batch_start in range(0, len(indices), batch_size):
+        batch_end = min(batch_start + batch_size, len(indices))
+        yield indices[batch_start:batch_end]
 
-    chunk_starts = np.arange(start, end, chunk_size)
-    rng.shuffle(chunk_starts)
-
-    for chunk_start in chunk_starts:
-        chunk_end = min(chunk_start + chunk_size, end)
-
-        for batch_start in range(chunk_start, chunk_end, batch_size):
-            batch_end = min(batch_start + batch_size, chunk_end)
-            yield slice(batch_start, batch_end)
-
-
-# ---------------------------------------------------------------------
-# Scaling
-# ---------------------------------------------------------------------
 
 def fit_scaler_in_batches(
     X: np.ndarray,
     train_end: int,
     batch_size: int,
 ) -> StandardScaler:
-    """
-    Fit StandardScaler without materializing the full training matrix.
-    """
     scaler = StandardScaler()
 
     for batch_slice in iter_sequential_batches(0, train_end, batch_size):
@@ -149,59 +111,312 @@ def transform_batch(
     X_batch: np.ndarray,
     scaler: StandardScaler,
 ) -> np.ndarray:
-    """
-    Standardize a batch manually to keep memory use predictable.
-    """
     X_batch = np.asarray(X_batch, dtype=np.float32)
 
     mean = scaler.mean_.astype(np.float32)
     scale = scaler.scale_.astype(np.float32)
     scale = np.where(scale == 0.0, 1.0, scale)
 
-    X_scaled = (X_batch - mean) / scale
-
-    return np.ascontiguousarray(X_scaled, dtype=np.float32)
+    return ((X_batch - mean) / scale).astype(np.float32)
 
 
-# ---------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------
-
-class LinearSoftmaxClassifier(nn.Module):
-    """
-    Multinomial logistic regression:
-
-        logits = W x + b
-        p(y | x) = softmax(logits)
-    """
-
-    def __init__(self, input_dim: int, num_classes: int) -> None:
+class SpatialJointNN(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        clip_ticks: int,
+        hidden_dims: list[int],
+        bid_hidden_dim: int = 128,
+        dropout: float = 0.2,
+    ) -> None:
         super().__init__()
-        self.linear = nn.Linear(input_dim, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x)
+        if clip_ticks < 1:
+            raise ValueError("clip_ticks must be at least 1.")
 
+        self.clip_ticks = int(clip_ticks)
+        self.num_values = 2 * self.clip_ticks + 1
+        self.num_hazards = max(self.clip_ticks - 1, 0)
 
-# ---------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------
+        layers = []
+        previous_dim = input_dim
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(previous_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            previous_dim = hidden_dim
+
+        self.encoder = nn.Sequential(*layers)
+        encoded_dim = previous_dim
+
+        self.ask_sign = nn.Linear(encoded_dim, 3)
+
+        if self.num_hazards > 0:
+            self.ask_pos_hazard = nn.Linear(encoded_dim, self.num_hazards)
+            self.ask_neg_hazard = nn.Linear(encoded_dim, self.num_hazards)
+        else:
+            self.ask_pos_hazard = None
+            self.ask_neg_hazard = None
+
+        bid_input_dim = encoded_dim + self.num_values + 1
+
+        self.bid_encoder = nn.Sequential(
+            nn.Linear(bid_input_dim, bid_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(bid_hidden_dim, bid_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.bid_sign = nn.Linear(bid_hidden_dim, 3)
+
+        if self.num_hazards > 0:
+            self.bid_pos_hazard = nn.Linear(bid_hidden_dim, self.num_hazards)
+            self.bid_neg_hazard = nn.Linear(bid_hidden_dim, self.num_hazards)
+        else:
+            self.bid_pos_hazard = None
+            self.bid_neg_hazard = None
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
+
+    def ask_distribution_parameters(
+        self,
+        encoded: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        sign_logits = self.ask_sign(encoded)
+
+        if self.num_hazards > 0:
+            pos_logits = self.ask_pos_hazard(encoded)
+            neg_logits = self.ask_neg_hazard(encoded)
+        else:
+            pos_logits = None
+            neg_logits = None
+
+        return sign_logits, pos_logits, neg_logits
+
+    def bid_distribution_parameters(
+        self,
+        encoded: torch.Tensor,
+        ask_value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        ask_class = ask_value + self.clip_ticks
+
+        ask_one_hot = F.one_hot(
+            ask_class,
+            num_classes=self.num_values,
+        ).float()
+
+        ask_scaled = ask_value.float().unsqueeze(1) / float(self.clip_ticks)
+
+        bid_input = torch.cat(
+            [encoded, ask_one_hot, ask_scaled],
+            dim=1,
+        )
+
+        bid_hidden = self.bid_encoder(bid_input)
+        sign_logits = self.bid_sign(bid_hidden)
+
+        if self.num_hazards > 0:
+            pos_logits = self.bid_pos_hazard(bid_hidden)
+            neg_logits = self.bid_neg_hazard(bid_hidden)
+        else:
+            pos_logits = None
+            neg_logits = None
+
+        return sign_logits, pos_logits, neg_logits
+
+    def log_probs_one_dim_all_values(
+        self,
+        sign_logits: torch.Tensor,
+        pos_logits: torch.Tensor | None,
+        neg_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch_size = sign_logits.shape[0]
+        device = sign_logits.device
+        K = self.clip_ticks
+        V = self.num_values
+
+        log_sign_probs = F.log_softmax(sign_logits, dim=1)
+
+        out = torch.empty(batch_size, V, device=device)
+
+        out[:, K] = log_sign_probs[:, 1]
+
+        if K == 1:
+            out[:, K + 1] = log_sign_probs[:, 2]
+            out[:, K - 1] = log_sign_probs[:, 0]
+            return out
+
+        assert pos_logits is not None
+        assert neg_logits is not None
+
+        pos_survival = F.logsigmoid(-pos_logits)
+        pos_stop = F.logsigmoid(pos_logits)
+
+        neg_survival = F.logsigmoid(-neg_logits)
+        neg_stop = F.logsigmoid(neg_logits)
+
+        zeros = torch.zeros(batch_size, 1, device=device)
+
+        pos_exclusive_survival = torch.cat(
+            [zeros, torch.cumsum(pos_survival[:, :-1], dim=1)],
+            dim=1,
+        )
+
+        neg_exclusive_survival = torch.cat(
+            [zeros, torch.cumsum(neg_survival[:, :-1], dim=1)],
+            dim=1,
+        )
+
+        pos_nonboundary = (
+            log_sign_probs[:, 2].unsqueeze(1)
+            + pos_exclusive_survival
+            + pos_stop
+        )
+
+        neg_nonboundary = (
+            log_sign_probs[:, 0].unsqueeze(1)
+            + neg_exclusive_survival
+            + neg_stop
+        )
+
+        out[:, K + 1: K + K] = pos_nonboundary
+        out[:, 1:K] = torch.flip(neg_nonboundary, dims=[1])
+
+        out[:, 2 * K] = (
+            log_sign_probs[:, 2]
+            + pos_survival.sum(dim=1)
+        )
+
+        out[:, 0] = (
+            log_sign_probs[:, 0]
+            + neg_survival.sum(dim=1)
+        )
+
+        return out
+
+    def log_prob_one_dim(
+        self,
+        y: torch.Tensor,
+        sign_logits: torch.Tensor,
+        pos_logits: torch.Tensor | None,
+        neg_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        all_log_probs = self.log_probs_one_dim_all_values(
+            sign_logits=sign_logits,
+            pos_logits=pos_logits,
+            neg_logits=neg_logits,
+        )
+
+        class_index = y + self.clip_ticks
+
+        return all_log_probs.gather(
+            dim=1,
+            index=class_index.unsqueeze(1),
+        ).squeeze(1)
+
+    def log_prob_pair(
+        self,
+        x: torch.Tensor,
+        y_pair: torch.Tensor,
+    ) -> torch.Tensor:
+        encoded = self.encode(x)
+
+        ask = y_pair[:, 0]
+        bid = y_pair[:, 1]
+
+        ask_sign, ask_pos, ask_neg = self.ask_distribution_parameters(encoded)
+
+        log_prob_ask = self.log_prob_one_dim(
+            y=ask,
+            sign_logits=ask_sign,
+            pos_logits=ask_pos,
+            neg_logits=ask_neg,
+        )
+
+        bid_sign, bid_pos, bid_neg = self.bid_distribution_parameters(
+            encoded=encoded,
+            ask_value=ask,
+        )
+
+        log_prob_bid = self.log_prob_one_dim(
+            y=bid,
+            sign_logits=bid_sign,
+            pos_logits=bid_pos,
+            neg_logits=bid_neg,
+        )
+
+        return log_prob_ask + log_prob_bid
+
+    def joint_log_prob_grid(self, x: torch.Tensor) -> torch.Tensor:
+        encoded = self.encode(x)
+
+        batch_size = x.shape[0]
+        device = x.device
+        K = self.clip_ticks
+        V = self.num_values
+
+        values = torch.arange(
+            -K,
+            K + 1,
+            device=device,
+            dtype=torch.long,
+        )
+
+        ask_sign, ask_pos, ask_neg = self.ask_distribution_parameters(encoded)
+
+        ask_log_probs_all = self.log_probs_one_dim_all_values(
+            sign_logits=ask_sign,
+            pos_logits=ask_pos,
+            neg_logits=ask_neg,
+        )
+
+        encoded_repeated = (
+            encoded.unsqueeze(1)
+            .expand(batch_size, V, encoded.shape[1])
+            .reshape(batch_size * V, encoded.shape[1])
+        )
+
+        ask_values_repeated = (
+            values.unsqueeze(0)
+            .expand(batch_size, V)
+            .reshape(batch_size * V)
+        )
+
+        bid_sign, bid_pos, bid_neg = self.bid_distribution_parameters(
+            encoded=encoded_repeated,
+            ask_value=ask_values_repeated,
+        )
+
+        bid_log_probs_all = self.log_probs_one_dim_all_values(
+            sign_logits=bid_sign,
+            pos_logits=bid_pos,
+            neg_logits=bid_neg,
+        )
+
+        bid_log_probs_all = bid_log_probs_all.reshape(batch_size, V, V)
+
+        joint_log_probs = (
+            ask_log_probs_all.unsqueeze(2)
+            + bid_log_probs_all
+        )
+
+        return joint_log_probs.reshape(batch_size, V * V)
+
 
 def evaluate_nll_metrics(
-    model: nn.Module,
+    model: SpatialJointNN,
     X: np.ndarray,
-    y: np.ndarray,
+    y_pair: np.ndarray,
     scaler: StandardScaler,
     start: int,
     end: int,
     batch_size: int,
     device: torch.device,
-    zero_class: int,
 ) -> dict:
-    """
-    Evaluate NLL and movement-conditional NLL.
-    Does not store predictions.
-    """
     model.eval()
 
     total_loss = 0.0
@@ -213,18 +428,18 @@ def evaluate_nll_metrics(
     with torch.no_grad():
         for batch_slice in iter_sequential_batches(start, end, batch_size):
             X_batch_np = transform_batch(X[batch_slice], scaler)
-            y_batch_np = np.asarray(y[batch_slice], dtype=np.int64)
+            y_batch_np = np.asarray(y_pair[batch_slice], dtype=np.int64)
 
-            X_batch = torch.from_numpy(X_batch_np).to(device)
-            y_batch = torch.as_tensor(y_batch_np, dtype=torch.long, device=device)
+            X_batch = torch.tensor(X_batch_np, dtype=torch.float32, device=device)
+            y_batch = torch.tensor(y_batch_np, dtype=torch.long, device=device)
 
-            logits = model(X_batch)
-            losses = F.cross_entropy(logits, y_batch, reduction="none")
+            log_prob = model.log_prob_pair(X_batch, y_batch)
+            losses = -log_prob
 
             total_loss += float(losses.sum().item())
             total_samples += int(y_batch.shape[0])
 
-            movement_mask = y_batch != zero_class
+            movement_mask = (y_batch[:, 0] != 0) | (y_batch[:, 1] != 0)
 
             if movement_mask.any():
                 movement_loss += float(losses[movement_mask].sum().item())
@@ -242,22 +457,16 @@ def evaluate_nll_metrics(
 
 
 def evaluate_full(
-    model: nn.Module,
+    model: SpatialJointNN,
     X: np.ndarray,
-    y: np.ndarray,
+    y_pair: np.ndarray,
     scaler: StandardScaler,
     start: int,
     end: int,
     batch_size: int,
     device: torch.device,
     num_classes: int,
-    zero_class: int,
 ) -> tuple[dict, np.ndarray]:
-    """
-    Full evaluation with NLL, movement NLL, accuracy, macro-F1 and predictions.
-
-    This still avoids storing full probability matrices.
-    """
     model.eval()
 
     total_loss = 0.0
@@ -272,25 +481,32 @@ def evaluate_full(
     with torch.no_grad():
         for batch_slice in iter_sequential_batches(start, end, batch_size):
             X_batch_np = transform_batch(X[batch_slice], scaler)
-            y_batch_np = np.asarray(y[batch_slice], dtype=np.int64)
+            y_batch_np = np.asarray(y_pair[batch_slice], dtype=np.int64)
 
-            X_batch = torch.from_numpy(X_batch_np).to(device)
-            y_batch = torch.as_tensor(y_batch_np, dtype=torch.long, device=device)
+            X_batch = torch.tensor(X_batch_np, dtype=torch.float32, device=device)
+            y_batch = torch.tensor(y_batch_np, dtype=torch.long, device=device)
 
-            logits = model(X_batch)
-            losses = F.cross_entropy(logits, y_batch, reduction="none")
-            y_pred = torch.argmax(logits, dim=1)
+            log_prob = model.log_prob_pair(X_batch, y_batch)
+            losses = -log_prob
 
             total_loss += float(losses.sum().item())
             total_samples += int(y_batch.shape[0])
 
-            movement_mask = y_batch != zero_class
+            movement_mask = (y_batch[:, 0] != 0) | (y_batch[:, 1] != 0)
 
             if movement_mask.any():
                 movement_loss += float(losses[movement_mask].sum().item())
                 movement_samples += int(movement_mask.sum().item())
 
-            all_y_true.append(y_batch.cpu().numpy())
+            joint_log_probs = model.joint_log_prob_grid(X_batch)
+            y_pred = torch.argmax(joint_log_probs, dim=1)
+
+            y_true = (
+                (y_batch[:, 0] + model.clip_ticks) * model.num_values
+                + (y_batch[:, 1] + model.clip_ticks)
+            )
+
+            all_y_true.append(y_true.cpu().numpy())
             all_y_pred.append(y_pred.cpu().numpy())
 
     y_true = np.concatenate(all_y_true)
@@ -344,29 +560,23 @@ def print_most_common_predictions(
         )
 
 
-# ---------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------
-
 def train_model(
-    model: nn.Module,
+    model: SpatialJointNN,
     X: np.ndarray,
-    y: np.ndarray,
+    y_pair: np.ndarray,
     scaler: StandardScaler,
     train_end: int,
     validation_start: int,
     validation_end: int,
     batch_size: int,
     eval_batch_size: int,
-    chunk_size: int,
     device: torch.device,
     learning_rate: float,
     weight_decay: float,
     max_epochs: int,
     patience: int,
     seed: int,
-    zero_class: int,
-) -> tuple[nn.Module, list[dict], float]:
+) -> tuple[SpatialJointNN, list[dict], float]:
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
@@ -388,23 +598,22 @@ def train_model(
         running_loss = 0.0
         running_samples = 0
 
-        for batch_slice in iter_chunk_shuffled_slices(
+        for batch_indices in iter_shuffled_batches(
             start=0,
             end=train_end,
             batch_size=batch_size,
-            chunk_size=chunk_size,
             rng=rng,
         ):
-            X_batch_np = transform_batch(X[batch_slice], scaler)
-            y_batch_np = np.asarray(y[batch_slice], dtype=np.int64)
+            X_batch_np = transform_batch(X[batch_indices], scaler)
+            y_batch_np = np.asarray(y_pair[batch_indices], dtype=np.int64)
 
-            X_batch = torch.from_numpy(X_batch_np).to(device)
-            y_batch = torch.as_tensor(y_batch_np, dtype=torch.long, device=device)
+            X_batch = torch.tensor(X_batch_np, dtype=torch.float32, device=device)
+            y_batch = torch.tensor(y_batch_np, dtype=torch.long, device=device)
 
             optimizer.zero_grad(set_to_none=True)
 
-            logits = model(X_batch)
-            loss = F.cross_entropy(logits, y_batch)
+            log_prob = model.log_prob_pair(X_batch, y_batch)
+            loss = -log_prob.mean()
 
             loss.backward()
             optimizer.step()
@@ -418,23 +627,23 @@ def train_model(
         validation_metrics = evaluate_nll_metrics(
             model=model,
             X=X,
-            y=y,
+            y_pair=y_pair,
             scaler=scaler,
             start=validation_start,
             end=validation_end,
             batch_size=eval_batch_size,
             device=device,
-            zero_class=zero_class,
         )
 
         validation_nll = validation_metrics["negative_log_likelihood"]
-        validation_movement_nll = validation_metrics["movement_negative_log_likelihood"]
 
         epoch_result = {
             "epoch": epoch,
             "train_epoch_nll": float(train_epoch_nll),
             "validation_nll": float(validation_nll),
-            "validation_movement_nll": float(validation_movement_nll),
+            "validation_movement_nll": float(
+                validation_metrics["movement_negative_log_likelihood"]
+            ),
         }
 
         history.append(epoch_result)
@@ -443,7 +652,7 @@ def train_model(
             f"Epoch {epoch:>3} | "
             f"train NLL={train_epoch_nll:.4f} | "
             f"val NLL={validation_nll:.4f} | "
-            f"val move NLL={validation_movement_nll:.4f}"
+            f"val move NLL={validation_metrics['movement_negative_log_likelihood']:.4f}"
         )
 
         if validation_nll < best_validation_nll:
@@ -488,77 +697,33 @@ def print_metrics(name: str, metrics: dict) -> None:
         )
 
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train memory-efficient multinomial logistic regression."
+        description="Train reduced spatial neural network."
     )
 
     parser.add_argument(
         "--processed-dir",
         type=str,
-        default="data/processed/WSELOB_PKNORLEN_h30_L50_full_tick5",
+        default="data/processed/WSELOB_KGHM_h30_L50_full_tick5",
     )
 
     parser.add_argument(
         "--results-dir",
         type=str,
-        default="results/WSELOB_PKNORLEN_h30_L50_full_tick5",
+        default="results/WSELOB_KGHM_h30_L50_full_tick5_5days",
     )
 
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32768,
-        help="Training batch size. Larger is faster but uses more memory.",
-    )
-
-    parser.add_argument(
-        "--eval-batch-size",
-        type=int,
-        default=131072,
-        help="Evaluation batch size. Larger is faster but uses more memory.",
-    )
-
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=1_048_576,
-        help="Contiguous chunk size for chunk-shuffled training.",
-    )
-
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=3e-3,
-    )
-
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=1e-4,
-    )
-
-    parser.add_argument(
-        "--max-epochs",
-        type=int,
-        default=20,
-    )
-
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=3,
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
+    parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--eval-batch-size", type=int, default=32768)
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 128])
+    parser.add_argument("--bid-hidden-dim", type=int, default=128)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--max-epochs", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
@@ -568,14 +733,12 @@ def main() -> None:
     results_dir = resolve_project_path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    X, y_class, metadata = load_dataset(processed_dir)
+    X, y_pair, metadata = load_dataset(processed_dir)
 
-    num_samples = len(y_class)
+    num_samples = len(y_pair)
     input_dim = int(X.shape[1])
-    num_classes = int(metadata["num_classes"])
     clip_ticks = int(metadata["clip_ticks"])
-
-    zero_class = clip_ticks * (2 * clip_ticks + 1) + clip_ticks
+    num_classes = int(metadata["num_classes"])
 
     n_train, n_validation, n_test = chronological_split(num_samples)
 
@@ -590,8 +753,8 @@ def main() -> None:
 
     device = get_device()
 
-    print("Fast memory-efficient logistic regression baseline")
-    print("==================================================")
+    print("Reduced spatial neural network")
+    print("==============================")
     print(f"Device:                  {device}")
     print(f"Processed directory:     {processed_dir}")
     print(f"Results directory:       {results_dir}")
@@ -600,15 +763,13 @@ def main() -> None:
     print(f"Validation samples:      {n_validation:,}")
     print(f"Test samples:            {n_test:,}")
     print(f"Number of features:      {input_dim}")
+    print(f"Clip ticks:              {clip_ticks}")
     print(f"Number of classes:       {num_classes}")
-    print(f"Zero class:              {zero_class}")
-    print(f"Batch size:              {args.batch_size}")
-    print(f"Eval batch size:         {args.eval_batch_size}")
-    print(f"Chunk size:              {args.chunk_size}")
+    print(f"Hidden layers:           {args.hidden_dims}")
+    print(f"Bid hidden dimension:    {args.bid_hidden_dim}")
+    print(f"Dropout:                 {args.dropout}")
     print(f"Learning rate:           {args.learning_rate}")
     print(f"Weight decay:            {args.weight_decay}")
-    print(f"Max epochs:              {args.max_epochs}")
-    print(f"Patience:                {args.patience}")
     print()
 
     print("Fitting scaler in batches...")
@@ -620,29 +781,30 @@ def main() -> None:
     print("Scaler fitted.")
     print()
 
-    model = LinearSoftmaxClassifier(
+    model = SpatialJointNN(
         input_dim=input_dim,
-        num_classes=num_classes,
+        clip_ticks=clip_ticks,
+        hidden_dims=args.hidden_dims,
+        bid_hidden_dim=args.bid_hidden_dim,
+        dropout=args.dropout,
     ).to(device)
 
     model, history, training_time = train_model(
         model=model,
         X=X,
-        y=y_class,
+        y_pair=y_pair,
         scaler=scaler,
         train_end=train_end,
         validation_start=validation_start,
         validation_end=validation_end,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
-        chunk_size=args.chunk_size,
         device=device,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         max_epochs=args.max_epochs,
         patience=args.patience,
         seed=args.seed,
-        zero_class=zero_class,
     )
 
     print()
@@ -652,38 +814,35 @@ def main() -> None:
     train_metrics = evaluate_nll_metrics(
         model=model,
         X=X,
-        y=y_class,
+        y_pair=y_pair,
         scaler=scaler,
         start=train_start,
         end=train_end,
         batch_size=args.eval_batch_size,
         device=device,
-        zero_class=zero_class,
     )
 
     validation_metrics = evaluate_nll_metrics(
         model=model,
         X=X,
-        y=y_class,
+        y_pair=y_pair,
         scaler=scaler,
         start=validation_start,
         end=validation_end,
         batch_size=args.eval_batch_size,
         device=device,
-        zero_class=zero_class,
     )
 
     test_metrics, test_predictions = evaluate_full(
         model=model,
         X=X,
-        y=y_class,
+        y_pair=y_pair,
         scaler=scaler,
         start=test_start,
         end=test_end,
         batch_size=args.eval_batch_size,
         device=device,
         num_classes=num_classes,
-        zero_class=zero_class,
     )
 
     print_most_common_predictions(
@@ -699,18 +858,18 @@ def main() -> None:
     print_metrics("Test", test_metrics)
 
     output = {
-        "model": "linear_softmax_logistic_regression",
-        "training_method": "mini_batch_adam_chunk_shuffled",
+        "model": "reduced_spatial_neural_network",
         "metadata": metadata,
         "input_dim": input_dim,
-        "num_classes": num_classes,
         "clip_ticks": clip_ticks,
-        "zero_class": int(zero_class),
+        "num_classes": num_classes,
+        "hidden_dims": args.hidden_dims,
+        "bid_hidden_dim": args.bid_hidden_dim,
+        "dropout": args.dropout,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
-        "chunk_size": args.chunk_size,
         "max_epochs": args.max_epochs,
         "patience": args.patience,
         "seed": args.seed,
@@ -721,18 +880,21 @@ def main() -> None:
         "test_metrics": test_metrics,
     }
 
-    output_path = results_dir / "logistic_regression.json"
+    output_path = results_dir / "spatial_nn.json"
 
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
 
-    model_path = results_dir / "logistic_regression.pt"
+    model_path = results_dir / "spatial_nn.pt"
 
     torch.save(
         {
             "model_state_dict": model.state_dict(),
             "input_dim": input_dim,
-            "num_classes": num_classes,
+            "clip_ticks": clip_ticks,
+            "hidden_dims": args.hidden_dims,
+            "bid_hidden_dim": args.bid_hidden_dim,
+            "dropout": args.dropout,
             "metadata": metadata,
             "scaler_mean": scaler.mean_,
             "scaler_scale": scaler.scale_,

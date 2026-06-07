@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import json
 import time
 import random
@@ -6,16 +7,20 @@ import random
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import TensorDataset, DataLoader
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 
 
 def get_project_root() -> Path:
-    """
-    Assumes this file is located in project/src/.
-    """
     return Path(__file__).resolve().parents[1]
+
+
+def resolve_project_path(path: str | Path) -> Path:
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return get_project_root() / path
 
 
 def set_seed(seed: int = 42) -> None:
@@ -28,9 +33,6 @@ def set_seed(seed: int = 42) -> None:
 
 
 def get_device() -> torch.device:
-    """
-    Use CUDA if available, otherwise Apple MPS if available, otherwise CPU.
-    """
     if torch.cuda.is_available():
         return torch.device("cuda")
 
@@ -41,8 +43,8 @@ def get_device() -> torch.device:
 
 
 def load_dataset(processed_dir: Path) -> tuple[np.ndarray, np.ndarray, dict]:
-    X = np.load(processed_dir / "X.npy")
-    y_class = np.load(processed_dir / "y_class.npy")
+    X = np.load(processed_dir / "X.npy", mmap_mode="r")
+    y_class = np.load(processed_dir / "y_class.npy", mmap_mode="r")
 
     with open(processed_dir / "metadata.json", "r") as f:
         metadata = json.load(f)
@@ -54,15 +56,12 @@ def chronological_split(
     n_samples: int,
     train_fraction: float = 0.7,
     validation_fraction: float = 0.15,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[int, int, int]:
     n_train = int(train_fraction * n_samples)
     n_validation = int(validation_fraction * n_samples)
+    n_test = n_samples - n_train - n_validation
 
-    train_idx = np.arange(0, n_train)
-    validation_idx = np.arange(n_train, n_train + n_validation)
-    test_idx = np.arange(n_train + n_validation, n_samples)
-
-    return train_idx, validation_idx, test_idx
+    return n_train, n_validation, n_test
 
 
 def decode_class(class_id: int, clip_ticks: int) -> tuple[int, int]:
@@ -72,6 +71,53 @@ def decode_class(class_id: int, clip_ticks: int) -> tuple[int, int]:
     delta_bid = class_id % num_values - clip_ticks
 
     return int(delta_ask), int(delta_bid)
+
+
+def iter_sequential_batches(start: int, end: int, batch_size: int):
+    for batch_start in range(start, end, batch_size):
+        batch_end = min(batch_start + batch_size, end)
+        yield slice(batch_start, batch_end)
+
+
+def iter_shuffled_batches(
+    start: int,
+    end: int,
+    batch_size: int,
+    rng: np.random.Generator,
+):
+    indices = np.arange(start, end)
+    rng.shuffle(indices)
+
+    for batch_start in range(0, len(indices), batch_size):
+        batch_end = min(batch_start + batch_size, len(indices))
+        yield indices[batch_start:batch_end]
+
+
+def fit_scaler_in_batches(
+    X: np.ndarray,
+    train_end: int,
+    batch_size: int,
+) -> StandardScaler:
+    scaler = StandardScaler()
+
+    for batch_slice in iter_sequential_batches(0, train_end, batch_size):
+        X_batch = np.asarray(X[batch_slice], dtype=np.float32)
+        scaler.partial_fit(X_batch)
+
+    return scaler
+
+
+def transform_batch(
+    X_batch: np.ndarray,
+    scaler: StandardScaler,
+) -> np.ndarray:
+    X_batch = np.asarray(X_batch, dtype=np.float32)
+
+    mean = scaler.mean_.astype(np.float32)
+    scale = scaler.scale_.astype(np.float32)
+    scale = np.where(scale == 0.0, 1.0, scale)
+
+    return ((X_batch - mean) / scale).astype(np.float32)
 
 
 class MLPClassifier(nn.Module):
@@ -101,52 +147,100 @@ class MLPClassifier(nn.Module):
         return self.network(x)
 
 
-def make_loader(
+def evaluate_nll_metrics(
+    model: nn.Module,
     X: np.ndarray,
     y: np.ndarray,
+    scaler: StandardScaler,
+    start: int,
+    end: int,
     batch_size: int,
-    shuffle: bool,
-) -> DataLoader:
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(y, dtype=torch.long)
-
-    dataset = TensorDataset(X_tensor, y_tensor)
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-    )
-
-
-def evaluate_model(
-    model: nn.Module,
-    data_loader: DataLoader,
     device: torch.device,
-    num_classes: int,
+    zero_class: int,
 ) -> dict:
     model.eval()
 
     total_loss = 0.0
     total_samples = 0
 
+    movement_loss = 0.0
+    movement_samples = 0
+
+    with torch.no_grad():
+        for batch_slice in iter_sequential_batches(start, end, batch_size):
+            X_batch_np = transform_batch(X[batch_slice], scaler)
+            y_batch_np = np.asarray(y[batch_slice], dtype=np.int64)
+
+            X_batch = torch.tensor(X_batch_np, dtype=torch.float32, device=device)
+            y_batch = torch.tensor(y_batch_np, dtype=torch.long, device=device)
+
+            logits = model(X_batch)
+            losses = F.cross_entropy(logits, y_batch, reduction="none")
+
+            total_loss += float(losses.sum().item())
+            total_samples += int(y_batch.shape[0])
+
+            movement_mask = y_batch != zero_class
+
+            if movement_mask.any():
+                movement_loss += float(losses[movement_mask].sum().item())
+                movement_samples += int(movement_mask.sum().item())
+
+    nll = total_loss / total_samples
+    movement_nll = movement_loss / movement_samples if movement_samples > 0 else np.nan
+    movement_share = movement_samples / total_samples
+
+    return {
+        "negative_log_likelihood": float(nll),
+        "movement_negative_log_likelihood": float(movement_nll),
+        "movement_share": float(movement_share),
+    }
+
+
+def evaluate_full(
+    model: nn.Module,
+    X: np.ndarray,
+    y: np.ndarray,
+    scaler: StandardScaler,
+    start: int,
+    end: int,
+    batch_size: int,
+    device: torch.device,
+    num_classes: int,
+    zero_class: int,
+) -> tuple[dict, np.ndarray]:
+    model.eval()
+
+    total_loss = 0.0
+    total_samples = 0
+
+    movement_loss = 0.0
+    movement_samples = 0
+
     all_y_true = []
     all_y_pred = []
 
-    criterion = nn.CrossEntropyLoss(reduction="sum")
-
     with torch.no_grad():
-        for X_batch, y_batch in data_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+        for batch_slice in iter_sequential_batches(start, end, batch_size):
+            X_batch_np = transform_batch(X[batch_slice], scaler)
+            y_batch_np = np.asarray(y[batch_slice], dtype=np.int64)
+
+            X_batch = torch.tensor(X_batch_np, dtype=torch.float32, device=device)
+            y_batch = torch.tensor(y_batch_np, dtype=torch.long, device=device)
 
             logits = model(X_batch)
-            loss = criterion(logits, y_batch)
-
-            total_loss += float(loss.item())
-            total_samples += int(y_batch.shape[0])
+            losses = F.cross_entropy(logits, y_batch, reduction="none")
 
             y_pred = torch.argmax(logits, dim=1)
+
+            total_loss += float(losses.sum().item())
+            total_samples += int(y_batch.shape[0])
+
+            movement_mask = y_batch != zero_class
+
+            if movement_mask.any():
+                movement_loss += float(losses[movement_mask].sum().item())
+                movement_samples += int(movement_mask.sum().item())
 
             all_y_true.append(y_batch.cpu().numpy())
             all_y_pred.append(y_pred.cpu().numpy())
@@ -155,6 +249,9 @@ def evaluate_model(
     y_pred = np.concatenate(all_y_pred)
 
     nll = total_loss / total_samples
+    movement_nll = movement_loss / movement_samples if movement_samples > 0 else np.nan
+    movement_share = movement_samples / total_samples
+
     accuracy = accuracy_score(y_true, y_pred)
 
     macro_f1 = f1_score(
@@ -165,32 +262,15 @@ def evaluate_model(
         zero_division=0,
     )
 
-    return {
+    metrics = {
         "negative_log_likelihood": float(nll),
+        "movement_negative_log_likelihood": float(movement_nll),
+        "movement_share": float(movement_share),
         "accuracy": float(accuracy),
         "macro_f1": float(macro_f1),
     }
 
-
-def get_predictions(
-    model: nn.Module,
-    data_loader: DataLoader,
-    device: torch.device,
-) -> np.ndarray:
-    model.eval()
-
-    predictions = []
-
-    with torch.no_grad():
-        for X_batch, _ in data_loader:
-            X_batch = X_batch.to(device)
-
-            logits = model(X_batch)
-            y_pred = torch.argmax(logits, dim=1)
-
-            predictions.append(y_pred.cpu().numpy())
-
-    return np.concatenate(predictions)
+    return metrics, y_pred
 
 
 def print_most_common_predictions(
@@ -218,17 +298,22 @@ def print_most_common_predictions(
 
 def train_model(
     model: nn.Module,
-    train_loader: DataLoader,
-    validation_loader: DataLoader,
+    X: np.ndarray,
+    y: np.ndarray,
+    scaler: StandardScaler,
+    train_end: int,
+    validation_start: int,
+    validation_end: int,
+    batch_size: int,
+    eval_batch_size: int,
     device: torch.device,
-    num_classes: int,
     learning_rate: float,
     weight_decay: float,
     max_epochs: int,
     patience: int,
+    seed: int,
+    zero_class: int,
 ) -> tuple[nn.Module, list[dict], float]:
-    criterion = nn.CrossEntropyLoss()
-
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=learning_rate,
@@ -240,8 +325,9 @@ def train_model(
     epochs_without_improvement = 0
 
     history = []
-
     start_time = time.time()
+
+    rng = np.random.default_rng(seed)
 
     for epoch in range(1, max_epochs + 1):
         model.train()
@@ -249,28 +335,42 @@ def train_model(
         running_loss = 0.0
         running_samples = 0
 
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+        for batch_indices in iter_shuffled_batches(
+            start=0,
+            end=train_end,
+            batch_size=batch_size,
+            rng=rng,
+        ):
+            X_batch_np = transform_batch(X[batch_indices], scaler)
+            y_batch_np = np.asarray(y[batch_indices], dtype=np.int64)
 
-            optimizer.zero_grad()
+            X_batch = torch.tensor(X_batch_np, dtype=torch.float32, device=device)
+            y_batch = torch.tensor(y_batch_np, dtype=torch.long, device=device)
+
+            optimizer.zero_grad(set_to_none=True)
 
             logits = model(X_batch)
-            loss = criterion(logits, y_batch)
+            loss = F.cross_entropy(logits, y_batch)
 
             loss.backward()
             optimizer.step()
 
-            running_loss += float(loss.item()) * int(y_batch.shape[0])
-            running_samples += int(y_batch.shape[0])
+            current_batch_size = int(y_batch.shape[0])
+            running_loss += float(loss.item()) * current_batch_size
+            running_samples += current_batch_size
 
         train_epoch_nll = running_loss / running_samples
 
-        validation_metrics = evaluate_model(
+        validation_metrics = evaluate_nll_metrics(
             model=model,
-            data_loader=validation_loader,
+            X=X,
+            y=y,
+            scaler=scaler,
+            start=validation_start,
+            end=validation_end,
+            batch_size=eval_batch_size,
             device=device,
-            num_classes=num_classes,
+            zero_class=zero_class,
         )
 
         validation_nll = validation_metrics["negative_log_likelihood"]
@@ -279,8 +379,9 @@ def train_model(
             "epoch": epoch,
             "train_epoch_nll": float(train_epoch_nll),
             "validation_nll": float(validation_nll),
-            "validation_accuracy": float(validation_metrics["accuracy"]),
-            "validation_macro_f1": float(validation_metrics["macro_f1"]),
+            "validation_movement_nll": float(
+                validation_metrics["movement_negative_log_likelihood"]
+            ),
         }
 
         history.append(epoch_result)
@@ -289,8 +390,7 @@ def train_model(
             f"Epoch {epoch:>3} | "
             f"train NLL={train_epoch_nll:.4f} | "
             f"val NLL={validation_nll:.4f} | "
-            f"val acc={100 * validation_metrics['accuracy']:.2f}% | "
-            f"val macro-F1={validation_metrics['macro_f1']:.4f}"
+            f"val move NLL={validation_metrics['movement_negative_log_likelihood']:.4f}"
         )
 
         if validation_nll < best_validation_nll:
@@ -316,23 +416,58 @@ def train_model(
     return model, history, training_time
 
 
+def print_metrics(name: str, metrics: dict) -> None:
+    if "accuracy" in metrics:
+        print(
+            f"{name:<11} "
+            f"NLL: {metrics['negative_log_likelihood']:.4f} | "
+            f"Move NLL: {metrics['movement_negative_log_likelihood']:.4f} | "
+            f"Move share: {100 * metrics['movement_share']:.2f}% | "
+            f"Accuracy: {100 * metrics['accuracy']:.2f}% | "
+            f"Macro-F1: {metrics['macro_f1']:.4f}"
+        )
+    else:
+        print(
+            f"{name:<11} "
+            f"NLL: {metrics['negative_log_likelihood']:.4f} | "
+            f"Move NLL: {metrics['movement_negative_log_likelihood']:.4f} | "
+            f"Move share: {100 * metrics['movement_share']:.2f}%"
+        )
+
+
 def main() -> None:
-    set_seed(42)
-
-    project_root = get_project_root()
-
-    processed_dir = (
-        project_root
-        / "data"
-        / "processed"
-        / "AAPL_2012-06-21_50"
+    parser = argparse.ArgumentParser(
+        description="Train standard MLP baseline."
     )
 
-    results_dir = (
-        project_root
-        / "results"
-        / "AAPL_2012-06-21_50"
+    parser.add_argument(
+        "--processed-dir",
+        type=str,
+        default="data/processed/WSELOB_PKNORLEN_h30_L50_full_tick5",
     )
+
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default="results/WSELOB_PKNORLEN_h30_L50_full_tick5",
+    )
+
+    parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--eval-batch-size", type=int, default=32768)
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[128, 128])
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--max-epochs", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+
+    processed_dir = resolve_project_path(args.processed_dir)
+    results_dir = resolve_project_path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
     X, y_class, metadata = load_dataset(processed_dir)
@@ -342,123 +477,113 @@ def main() -> None:
     num_classes = int(metadata["num_classes"])
     clip_ticks = int(metadata["clip_ticks"])
 
-    train_idx, validation_idx, test_idx = chronological_split(num_samples)
+    zero_class = clip_ticks * (2 * clip_ticks + 1) + clip_ticks
 
-    X_train = X[train_idx]
-    X_validation = X[validation_idx]
-    X_test = X[test_idx]
+    n_train, n_validation, n_test = chronological_split(num_samples)
 
-    y_train = y_class[train_idx]
-    y_validation = y_class[validation_idx]
-    y_test = y_class[test_idx]
+    train_start = 0
+    train_end = n_train
 
-    scaler = StandardScaler()
+    validation_start = n_train
+    validation_end = n_train + n_validation
 
-    X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
-    X_validation_scaled = scaler.transform(X_validation).astype(np.float32)
-    X_test_scaled = scaler.transform(X_test).astype(np.float32)
-
-    batch_size = 512
-    hidden_dims = [128, 128]
-    dropout = 0.2
-    learning_rate = 1e-3
-    weight_decay = 1e-4
-    max_epochs = 50
-    patience = 6
-
-    train_loader = make_loader(
-        X=X_train_scaled,
-        y=y_train,
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
-    validation_loader = make_loader(
-        X=X_validation_scaled,
-        y=y_validation,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    test_loader = make_loader(
-        X=X_test_scaled,
-        y=y_test,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    train_eval_loader = make_loader(
-        X=X_train_scaled,
-        y=y_train,
-        batch_size=batch_size,
-        shuffle=False,
-    )
+    test_start = validation_end
+    test_end = num_samples
 
     device = get_device()
-
-    model = MLPClassifier(
-        input_dim=input_dim,
-        num_classes=num_classes,
-        hidden_dims=hidden_dims,
-        dropout=dropout,
-    ).to(device)
 
     print("Standard neural network baseline")
     print("================================")
     print(f"Device:                  {device}")
+    print(f"Processed directory:     {processed_dir}")
+    print(f"Results directory:       {results_dir}")
     print(f"Number of samples:       {num_samples:,}")
-    print(f"Training samples:        {len(train_idx):,}")
-    print(f"Validation samples:      {len(validation_idx):,}")
-    print(f"Test samples:            {len(test_idx):,}")
+    print(f"Training samples:        {n_train:,}")
+    print(f"Validation samples:      {n_validation:,}")
+    print(f"Test samples:            {n_test:,}")
     print(f"Number of features:      {input_dim}")
     print(f"Number of classes:       {num_classes}")
-    print(f"Hidden layers:           {hidden_dims}")
-    print(f"Dropout:                 {dropout}")
-    print(f"Learning rate:           {learning_rate}")
-    print(f"Weight decay:            {weight_decay}")
+    print(f"Zero class:              {zero_class}")
+    print(f"Hidden layers:           {args.hidden_dims}")
+    print(f"Dropout:                 {args.dropout}")
+    print(f"Learning rate:           {args.learning_rate}")
+    print(f"Weight decay:            {args.weight_decay}")
     print()
+
+    print("Fitting scaler in batches...")
+    scaler = fit_scaler_in_batches(
+        X=X,
+        train_end=train_end,
+        batch_size=args.eval_batch_size,
+    )
+    print("Scaler fitted.")
+    print()
+
+    model = MLPClassifier(
+        input_dim=input_dim,
+        num_classes=num_classes,
+        hidden_dims=args.hidden_dims,
+        dropout=args.dropout,
+    ).to(device)
 
     model, history, training_time = train_model(
         model=model,
-        train_loader=train_loader,
-        validation_loader=validation_loader,
+        X=X,
+        y=y_class,
+        scaler=scaler,
+        train_end=train_end,
+        validation_start=validation_start,
+        validation_end=validation_end,
+        batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
         device=device,
-        num_classes=num_classes,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        max_epochs=max_epochs,
-        patience=patience,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        max_epochs=args.max_epochs,
+        patience=args.patience,
+        seed=args.seed,
+        zero_class=zero_class,
     )
 
     print()
     print(f"Training time:           {training_time:.2f} seconds")
     print()
 
-    train_metrics = evaluate_model(
+    train_metrics = evaluate_nll_metrics(
         model=model,
-        data_loader=train_eval_loader,
+        X=X,
+        y=y_class,
+        scaler=scaler,
+        start=train_start,
+        end=train_end,
+        batch_size=args.eval_batch_size,
         device=device,
-        num_classes=num_classes,
+        zero_class=zero_class,
     )
 
-    validation_metrics = evaluate_model(
+    validation_metrics = evaluate_nll_metrics(
         model=model,
-        data_loader=validation_loader,
+        X=X,
+        y=y_class,
+        scaler=scaler,
+        start=validation_start,
+        end=validation_end,
+        batch_size=args.eval_batch_size,
         device=device,
-        num_classes=num_classes,
+        zero_class=zero_class,
     )
 
-    test_metrics = evaluate_model(
+    test_metrics, test_predictions = evaluate_full(
         model=model,
-        data_loader=test_loader,
+        X=X,
+        y=y_class,
+        scaler=scaler,
+        start=test_start,
+        end=test_end,
+        batch_size=args.eval_batch_size,
         device=device,
         num_classes=num_classes,
-    )
-
-    test_predictions = get_predictions(
-        model=model,
-        data_loader=test_loader,
-        device=device,
+        zero_class=zero_class,
     )
 
     print_most_common_predictions(
@@ -469,33 +594,26 @@ def main() -> None:
     print()
     print("Final metrics for best validation model")
     print("---------------------------------------")
-    print(
-        f"Train NLL:       {train_metrics['negative_log_likelihood']:.4f} | "
-        f"Accuracy: {100 * train_metrics['accuracy']:.2f}% | "
-        f"Macro-F1: {train_metrics['macro_f1']:.4f}"
-    )
-    print(
-        f"Validation NLL:  {validation_metrics['negative_log_likelihood']:.4f} | "
-        f"Accuracy: {100 * validation_metrics['accuracy']:.2f}% | "
-        f"Macro-F1: {validation_metrics['macro_f1']:.4f}"
-    )
-    print(
-        f"Test NLL:        {test_metrics['negative_log_likelihood']:.4f} | "
-        f"Accuracy: {100 * test_metrics['accuracy']:.2f}% | "
-        f"Macro-F1: {test_metrics['macro_f1']:.4f}"
-    )
+    print_metrics("Train", train_metrics)
+    print_metrics("Validation", validation_metrics)
+    print_metrics("Test", test_metrics)
 
     output = {
         "model": "standard_mlp",
         "metadata": metadata,
         "input_dim": input_dim,
-        "hidden_dims": hidden_dims,
-        "dropout": dropout,
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "batch_size": batch_size,
-        "max_epochs": max_epochs,
-        "patience": patience,
+        "num_classes": num_classes,
+        "clip_ticks": clip_ticks,
+        "zero_class": int(zero_class),
+        "hidden_dims": args.hidden_dims,
+        "dropout": args.dropout,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
+        "max_epochs": args.max_epochs,
+        "patience": args.patience,
+        "seed": args.seed,
         "training_time_seconds": float(training_time),
         "history": history,
         "train_metrics": train_metrics,
@@ -515,9 +633,11 @@ def main() -> None:
             "model_state_dict": model.state_dict(),
             "input_dim": input_dim,
             "num_classes": num_classes,
-            "hidden_dims": hidden_dims,
-            "dropout": dropout,
+            "hidden_dims": args.hidden_dims,
+            "dropout": args.dropout,
             "metadata": metadata,
+            "scaler_mean": scaler.mean_,
+            "scaler_scale": scaler.scale_,
         },
         model_path,
     )
