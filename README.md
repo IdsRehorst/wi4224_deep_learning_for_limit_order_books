@@ -18,8 +18,6 @@ The final experiments use the **WSELOB-2017** dataset, a publicly available year
 - reduced spatial neural network;
 - full local spatial neural network.
 
-The project should be viewed as a reduced replication. The original paper uses a much larger NASDAQ Level III dataset and substantially more computational resources. Here, the goal is to reproduce the main modelling idea on a smaller but still realistic public dataset.
-
 ---
 
 ## Project Structure
@@ -149,25 +147,7 @@ The split is chronological, so models are trained on earlier observations and ev
 
 ## Quick Start
 
-### 1. Install dependencies
-
-Create and activate a virtual environment, then install the required packages.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-On Windows, activate the environment with:
-
-```bash
-.venv\Scripts\activate
-```
-
----
-
-### 2. Convert a WSELOB stock file
+### 1. Convert a WSELOB stock file
 
 Example for KGHM:
 
@@ -202,7 +182,7 @@ The `spatial/` folder contains additional arrays needed for the full local spati
 
 ---
 
-### 3. Train the empirical baseline
+### 2. Train the empirical baseline
 
 ```bash
 python src/train_empirical.py \
@@ -218,7 +198,7 @@ The empirical baseline ignores the current order book state and estimates the un
 
 ---
 
-### 4. Train the logistic regression baseline
+### 3. Train the logistic regression baseline
 
 ```bash
 python src/train_logistic.py \
@@ -230,7 +210,7 @@ This trains a multinomial logistic regression model using mini-batch optimizatio
 
 ---
 
-### 5. Train the standard neural network
+### 4. Train the standard neural network
 
 ```bash
 python src/train_mlp.py \
@@ -242,7 +222,7 @@ This trains a feedforward neural network that maps the order book feature vector
 
 ---
 
-### 6. Train the reduced spatial neural network
+### 5. Train the reduced spatial neural network
 
 ```bash
 python src/train_spatial.py \
@@ -254,7 +234,7 @@ The reduced spatial neural network uses a structured hazard-style output represe
 
 ---
 
-### 7. Train the full local spatial neural network
+### 6. Train the full local spatial neural network
 
 ```bash
 python src/train_full_spatial.py \
@@ -387,4 +367,4 @@ To reproduce the experiments:
 3. run `convert_wselob.py` for the desired stock;
 4. run the training scripts on the processed dataset.
 
-The code was developed for a reduced replication and course project. It is intended for experimentation and research, not for production trading.
+The code was developed for a reduced replication and course project. 
