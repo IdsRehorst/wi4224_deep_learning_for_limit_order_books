@@ -527,11 +527,6 @@ def scatter_log_sizes_to_dense(
 ) -> np.ndarray:
     """
     Convert sparse observed levels into a dense tick-offset grid.
-
-    Output:
-        dense[n, k] = log size at tick offset k from best ask/bid.
-
-    Missing tick levels remain zero.
     """
     n_samples, num_levels = log_size.shape
 
@@ -571,11 +566,6 @@ def save_dense_spatial_arrays(
     """
     Save dense ask/bid log-size arrays in chunks to avoid a large temporary
     allocation.
-
-    Dense arrays have shape:
-        (num_samples, dense_max_offset + 1)
-
-    Index k means k ticks away from the current best ask/bid.
     """
     n_samples = ask_log_size.shape[0]
 
@@ -634,16 +624,6 @@ def save_dataset(
 ) -> None:
     """
     Save processed dataset.
-
-    Old flat outputs are preserved:
-        X.npy
-        y_pair.npy
-        y_class.npy
-        feature_names.json
-        metadata.json
-
-    New spatial outputs are saved in:
-        spatial/
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 

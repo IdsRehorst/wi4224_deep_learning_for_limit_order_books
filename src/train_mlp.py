@@ -208,7 +208,7 @@ def evaluate_full(
     device: torch.device,
     num_classes: int,
     zero_class: int,
-) -> tuple[dict, np.ndarray]:
+) -> tuple[dict, np.ndarray, np.ndarray]:
     model.eval()
 
     total_loss = 0.0
@@ -219,6 +219,9 @@ def evaluate_full(
 
     all_y_true = []
     all_y_pred = []
+
+    movement_prob_sum = np.zeros(num_classes, dtype=np.float64)
+    movement_prob_samples = 0
 
     with torch.no_grad():
         for batch_slice in iter_sequential_batches(start, end, batch_size):
@@ -240,7 +243,15 @@ def evaluate_full(
 
             if movement_mask.any():
                 movement_loss += float(losses[movement_mask].sum().item())
-                movement_samples += int(movement_mask.sum().item())
+                movement_count = int(movement_mask.sum().item())
+                movement_samples += movement_count
+
+                # We only softmax the movement subset to avoid storing full test predictions.
+                movement_logits = logits[movement_mask]
+                movement_probs = F.softmax(movement_logits, dim=1)
+
+                movement_prob_sum += movement_probs.sum(dim=0).cpu().numpy()
+                movement_prob_samples += movement_count
 
             all_y_true.append(y_batch.cpu().numpy())
             all_y_pred.append(y_pred.cpu().numpy())
@@ -262,15 +273,21 @@ def evaluate_full(
         zero_division=0,
     )
 
+    if movement_prob_samples > 0:
+        avg_probs_movement = movement_prob_sum / movement_prob_samples
+    else:
+        avg_probs_movement = np.full(num_classes, np.nan)
+
     metrics = {
         "negative_log_likelihood": float(nll),
         "movement_negative_log_likelihood": float(movement_nll),
         "movement_share": float(movement_share),
         "accuracy": float(accuracy),
         "macro_f1": float(macro_f1),
+        "movement_probability_samples": int(movement_prob_samples),
     }
 
-    return metrics, y_pred
+    return metrics, y_pred, avg_probs_movement
 
 
 def print_most_common_predictions(
@@ -443,13 +460,13 @@ def main() -> None:
     parser.add_argument(
         "--processed-dir",
         type=str,
-        default="data/processed/WSELOB_PKNORLEN_h30_L50_full_tick5",
+        default="data/processed/WSELOB_KGHM_h30_L50_full_tick5",
     )
 
     parser.add_argument(
         "--results-dir",
         type=str,
-        default="results/WSELOB_PKNORLEN_h30_L50_full_tick5",
+        default="results/WSELOB_KGHM_h30_L50_full_tick5",
     )
 
     parser.add_argument("--batch-size", type=int, default=8192)
@@ -573,7 +590,7 @@ def main() -> None:
         zero_class=zero_class,
     )
 
-    test_metrics, test_predictions = evaluate_full(
+    test_metrics, test_predictions, test_avg_probs_movement = evaluate_full(
         model=model,
         X=X,
         y=y_class,
@@ -626,6 +643,13 @@ def main() -> None:
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
 
+    avg_probs_path = results_dir / "standard_mlp_avg_probs_movement_test.npy"
+
+    np.save(
+        avg_probs_path,
+        test_avg_probs_movement,
+    )
+
     model_path = results_dir / "standard_mlp.pt"
 
     torch.save(
@@ -644,6 +668,7 @@ def main() -> None:
 
     print()
     print(f"Saved results to: {output_path}")
+    print(f"Saved movement average probabilities to: {avg_probs_path}")
     print(f"Saved model to:   {model_path}")
 
 

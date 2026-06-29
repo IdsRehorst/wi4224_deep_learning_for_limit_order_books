@@ -466,7 +466,7 @@ def evaluate_full(
     batch_size: int,
     device: torch.device,
     num_classes: int,
-) -> tuple[dict, np.ndarray]:
+) -> tuple[dict, np.ndarray, np.ndarray]:
     model.eval()
 
     total_loss = 0.0
@@ -477,6 +477,9 @@ def evaluate_full(
 
     all_y_true = []
     all_y_pred = []
+
+    movement_prob_sum = np.zeros(num_classes, dtype=np.float64)
+    movement_prob_samples = 0
 
     with torch.no_grad():
         for batch_slice in iter_sequential_batches(start, end, batch_size):
@@ -500,6 +503,12 @@ def evaluate_full(
 
             joint_log_probs = model.joint_log_prob_grid(X_batch)
             y_pred = torch.argmax(joint_log_probs, dim=1)
+
+            # accumulate only movement observations.
+            if movement_mask.any():
+                joint_probs = torch.exp(joint_log_probs[movement_mask])
+                movement_prob_sum += joint_probs.sum(dim=0).cpu().numpy()
+                movement_prob_samples += int(movement_mask.sum().item())
 
             y_true = (
                 (y_batch[:, 0] + model.clip_ticks) * model.num_values
@@ -526,16 +535,21 @@ def evaluate_full(
         zero_division=0,
     )
 
+    if movement_prob_samples > 0:
+        avg_probs_movement = movement_prob_sum / movement_prob_samples
+    else:
+        avg_probs_movement = np.full(num_classes, np.nan)
+
     metrics = {
         "negative_log_likelihood": float(nll),
         "movement_negative_log_likelihood": float(movement_nll),
         "movement_share": float(movement_share),
         "accuracy": float(accuracy),
         "macro_f1": float(macro_f1),
+        "movement_probability_samples": int(movement_prob_samples),
     }
 
-    return metrics, y_pred
-
+    return metrics, y_pred, avg_probs_movement
 
 def print_most_common_predictions(
     y_pred: np.ndarray,
@@ -833,7 +847,7 @@ def main() -> None:
         device=device,
     )
 
-    test_metrics, test_predictions = evaluate_full(
+    test_metrics, test_predictions, test_avg_probs_movement = evaluate_full(
         model=model,
         X=X,
         y_pair=y_pair,
@@ -885,6 +899,13 @@ def main() -> None:
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
 
+    avg_probs_path = results_dir / "spatial_nn_avg_probs_movement_test.npy"
+
+    np.save(
+        avg_probs_path,
+        test_avg_probs_movement,
+    )
+
     model_path = results_dir / "spatial_nn.pt"
 
     torch.save(
@@ -904,8 +925,8 @@ def main() -> None:
 
     print()
     print(f"Saved results to: {output_path}")
+    print(f"Saved movement average probabilities to: {avg_probs_path}")
     print(f"Saved model to:   {model_path}")
-
 
 if __name__ == "__main__":
     main()

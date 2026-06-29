@@ -485,11 +485,7 @@ class FullSpatialJointNN(nn.Module):
             value=0.0,
         )
 
-        selected = torch.index_select(
-            padded,
-            dim=1,
-            index=self.local_indices_flat,
-        )
+        selected = torch.index_select(padded,dim=1,index=self.local_indices_flat,)
 
         batch_size = dense.shape[0]
 
@@ -773,9 +769,6 @@ class FullSpatialJointNN(nn.Module):
     ) -> torch.Tensor:
         """
         Compute full joint log probability grid.
-
-        Output:
-            (B, (2K+1)^2)
         """
         encoded = self.encode_global(
             ask_dense=ask_dense,
@@ -926,7 +919,7 @@ def evaluate_full(
     batch_size: int,
     device: torch.device,
     num_classes: int,
-) -> tuple[dict, np.ndarray]:
+) -> tuple[dict, np.ndarray, np.ndarray]:
     model.eval()
 
     total_loss = 0.0
@@ -937,6 +930,12 @@ def evaluate_full(
 
     all_y_true = []
     all_y_pred = []
+
+    # accumulate the average predicted distribution on movement
+    # observations only. This gives a compact length-441 vector that can be
+    # reshaped into a heatmap without saving all per-sample predictions.
+    movement_prob_sum = np.zeros(num_classes, dtype=np.float64)
+    movement_prob_samples = 0
 
     with torch.no_grad():
         for batch_slice in iter_sequential_batches(start, end, batch_size):
@@ -967,7 +966,8 @@ def evaluate_full(
 
             if movement_mask.any():
                 movement_loss += float(losses[movement_mask].sum().item())
-                movement_samples += int(movement_mask.sum().item())
+                movement_count = int(movement_mask.sum().item())
+                movement_samples += movement_count
 
             joint_log_probs = model.joint_log_prob_grid(
                 ask_dense=ask,
@@ -976,6 +976,15 @@ def evaluate_full(
             )
 
             y_pred = torch.argmax(joint_log_probs, dim=1)
+
+            # New: accumulate predicted probabilities on movement observations.
+            # joint_log_probs is already a normalized log-probability grid over
+            # the 441 joint movement classes, so exponentiating gives
+            # probabilities.
+            if movement_mask.any():
+                movement_probs = torch.exp(joint_log_probs[movement_mask])
+                movement_prob_sum += movement_probs.sum(dim=0).cpu().numpy()
+                movement_prob_samples += movement_count
 
             y_true = (
                 (y_pair[:, 0] + model.clip_ticks) * model.num_values
@@ -1002,15 +1011,21 @@ def evaluate_full(
         zero_division=0,
     )
 
+    if movement_prob_samples > 0:
+        avg_probs_movement = movement_prob_sum / movement_prob_samples
+    else:
+        avg_probs_movement = np.full(num_classes, np.nan)
+
     metrics = {
         "negative_log_likelihood": float(nll),
         "movement_negative_log_likelihood": float(movement_nll),
         "movement_share": float(movement_share),
         "accuracy": float(accuracy),
         "macro_f1": float(macro_f1),
+        "movement_probability_samples": int(movement_prob_samples),
     }
 
-    return metrics, y_pred
+    return metrics, y_pred, avg_probs_movement
 
 
 def print_most_common_predictions(
@@ -1403,7 +1418,7 @@ def main() -> None:
             device=device,
         )
 
-        test_metrics, test_predictions = evaluate_full(
+        test_metrics, test_predictions, test_avg_probs_movement = evaluate_full(
             model=model,
             arrays=arrays,
             scalers=scalers,
@@ -1427,12 +1442,13 @@ def main() -> None:
             clip_ticks=clip_ticks,
         )
 
-        return train_metrics, validation_metrics, test_metrics
+        return train_metrics, validation_metrics, test_metrics, test_avg_probs_movement
 
     (
         overall_train_metrics,
         overall_validation_metrics,
         overall_test_metrics,
+        overall_test_avg_probs_movement,
     ) = evaluate_checkpoint(
         selection_name="best_validation_nll",
         state_dict=checkpoint_state_dicts["best_validation_nll"],
@@ -1442,9 +1458,18 @@ def main() -> None:
         movement_train_metrics,
         movement_validation_metrics,
         movement_test_metrics,
+        movement_test_avg_probs_movement,
     ) = evaluate_checkpoint(
         selection_name="best_validation_movement_nll",
         state_dict=checkpoint_state_dicts["best_validation_movement_nll"],
+    )
+
+    overall_avg_probs_path = (
+        results_dir / "full_spatial_nn_best_validation_nll_avg_probs_movement_test.npy"
+    )
+    movement_avg_probs_path = (
+        results_dir
+        / "full_spatial_nn_best_validation_movement_nll_avg_probs_movement_test.npy"
     )
 
     output = {
@@ -1475,11 +1500,13 @@ def main() -> None:
             "train_metrics": overall_train_metrics,
             "validation_metrics": overall_validation_metrics,
             "test_metrics": overall_test_metrics,
+            "avg_probs_movement_test_file": overall_avg_probs_path.name,
         },
         "best_validation_movement_nll_checkpoint": {
             "train_metrics": movement_train_metrics,
             "validation_metrics": movement_validation_metrics,
             "test_metrics": movement_test_metrics,
+            "avg_probs_movement_test_file": movement_avg_probs_path.name,
         },
     }
 
@@ -1487,6 +1514,16 @@ def main() -> None:
 
     with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
+
+    np.save(
+        overall_avg_probs_path,
+        overall_test_avg_probs_movement,
+    )
+
+    np.save(
+        movement_avg_probs_path,
+        movement_test_avg_probs_movement,
+    )
 
     overall_model_path = results_dir / "full_spatial_nn_best_validation_nll.pt"
     movement_model_path = results_dir / "full_spatial_nn_best_validation_movement_nll.pt"
@@ -1531,6 +1568,8 @@ def main() -> None:
 
     print()
     print(f"Saved results to:                         {output_path}")
+    print(f"Saved best-validation-NLL avg probs to:   {overall_avg_probs_path}")
+    print(f"Saved best-movement-NLL avg probs to:     {movement_avg_probs_path}")
     print(f"Saved best-validation-NLL model to:       {overall_model_path}")
     print(f"Saved best-validation-movement model to:  {movement_model_path}")
 
